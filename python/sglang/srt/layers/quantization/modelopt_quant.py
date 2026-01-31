@@ -44,7 +44,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     is_layer_skipped,
@@ -307,11 +310,12 @@ class ModelOptQuantConfig(QuantizationConfig):
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
         elif isinstance(layer, FusedMoE):
-            # Check if MoE layer should be excluded from quantization
-            # (e.g., MTP layers that have no quantization scales in checkpoint)
-            if self.is_layer_excluded(prefix):
-                # Falls back to default unquantized MoE
-                return None
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            ) or self.is_layer_excluded(prefix):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
             return Moe(self)
         return None
 
