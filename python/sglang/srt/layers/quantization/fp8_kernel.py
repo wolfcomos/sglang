@@ -1192,74 +1192,134 @@ def w8a8_block_fp8_matmul(
 # Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
 @triton.jit
 def _mxfp8_block_scaled_matmul_kernel(  #
-    a_desc,  #
-    a_scale_desc,  #
-    b_desc,  #
-    b_scale_desc,  #
-    c_desc,  #
-    M: tl.constexpr,  #
-    N: tl.constexpr,  #
-    K: tl.constexpr,  #
-    output_type: tl.constexpr,  #
-    BLOCK_M: tl.constexpr,  #
-    BLOCK_N: tl.constexpr,  #
-    BLOCK_K: tl.constexpr,  #
-    rep_m: tl.constexpr,  #
-    rep_n: tl.constexpr,  #
-    rep_k: tl.constexpr,  #
-    NUM_STAGES: tl.constexpr,  #
-):  #
-    if output_type == 0:
-        output_dtype = tl.float32
-    elif output_type == 1:
-        output_dtype = tl.float16
-    elif output_type == 2:
-        output_dtype = tl.bfloat16
+    a_ptr, a_scale_ptr, b_ptr, b_scale_ptr, c_ptr,
+    M, N, K,
+    SCALE_M_DIM, SCALE_N_DIM, SCALE_K_DIM,
+    output_type: tl.constexpr,
+    stride_am, stride_ak,
+    stride_bn, stride_bk,
+    stride_cm, stride_cn,
+    a_scale_stride_m, a_scale_stride_k, a_scale_stride_dim3, a_scale_stride_dim4,
+    b_scale_stride_n, b_scale_stride_k, b_scale_stride_dim3, b_scale_stride_dim4,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    if output_type == 0: out_dtype = tl.float32
+    elif output_type == 1: out_dtype = tl.float16
+    else: out_dtype = tl.bfloat16
 
-    pid = tl.program_id(axis=0)
+    tl.static_assert(BLOCK_K % 32 == 0)
+    tl.static_assert(BLOCK_M % 128 == 0)
+    tl.static_assert(BLOCK_N % 128 == 0)
+
+    pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     pid_m = pid % num_pid_m
     pid_n = pid // num_pid_m
-    offs_am = pid_m * BLOCK_M
-    offs_bn = pid_n * BLOCK_N
-    offs_k_a = 0
-    offs_k_b = 0
-    offs_scale_m = pid_m * rep_m
-    offs_scale_n = pid_n * rep_n
-    offs_scale_k = 0
 
-    VEC_SIZE: tl.constexpr = 32
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k  = tl.arange(0, BLOCK_K)
 
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=NUM_STAGES):
-        a = a_desc.load([offs_am, offs_k_a])
-        b = b_desc.load([offs_bn, offs_k_b])
-        scale_a = a_scale_desc.load([0, offs_scale_m, offs_scale_k, 0, 0])
-        scale_b = b_scale_desc.load([0, offs_scale_n, offs_scale_k, 0, 0])
+    VEC: tl.constexpr = 32
+    rep_m = BLOCK_M // 128
+    rep_n = BLOCK_N // 128
+    rep_k = BLOCK_K // 128  # since rep_k in tutorial is BLOCK_K/(32*4) = BLOCK_K/128
 
-        scale_a = (
-            scale_a.reshape(rep_m, rep_k, 32, 4, 4)
-            .trans(0, 3, 2, 1, 4)
-            .reshape(BLOCK_M, BLOCK_K // VEC_SIZE)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+
+    for kk in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=NUM_STAGES):
+        k_ids = kk * BLOCK_K + offs_k
+
+        # FP8 blocks
+        a_ptrs = a_ptr + offs_am[:, None] * stride_am + k_ids[None, :] * stride_ak
+        b_ptrs = b_ptr + offs_bn[:, None] * stride_bn + k_ids[None, :] * stride_bk
+        a = tl.load(a_ptrs, mask=(offs_am[:, None] < M) & (k_ids[None, :] < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_bn[:, None] < N) & (k_ids[None, :] < K), other=0.0)
+
+        # scale offsets in (scale_m/scale_n, scale_k) coordinates
+        scale_m0 = pid_m * rep_m
+        scale_n0 = pid_n * rep_n
+        scale_k0 = kk * rep_k  # each BLOCK_K corresponds to rep_k scale-k steps
+
+        # Load [BLOCK_M, BLOCK_K//32] scale_a (uint8)
+        out_m = tl.arange(0, BLOCK_M)[:, None]
+        out_k = tl.arange(0, BLOCK_K // VEC)[None, :]
+
+        m_idx = out_m // 128
+        rem_m = out_m % 128
+        i4a  = rem_m // 32
+        i32  = rem_m % 32
+        k_idx = out_k // 4
+        i4b  = out_k % 4
+        flat = i32 * 16 + i4a * 4 + i4b
+        d3 = flat // 256
+        d4 = flat % 256
+
+        sa_ptrs = (
+            a_scale_ptr
+            + (scale_m0 + m_idx) * a_scale_stride_m
+            + (scale_k0 + k_idx) * a_scale_stride_k
+            + d3 * a_scale_stride_dim3
+            + d4 * a_scale_stride_dim4
         )
-        scale_b = (
-            scale_b.reshape(rep_n, rep_k, 32, 4, 4)
-            .trans(0, 3, 2, 1, 4)
-            .reshape(BLOCK_N, BLOCK_K // VEC_SIZE)
+        sa_mask = ((scale_m0 + m_idx) < SCALE_M_DIM) & ((scale_k0 + k_idx) < SCALE_K_DIM)
+        scale_a = tl.load(sa_ptrs, mask=sa_mask, other=0).to(tl.uint8)
+
+        # Load [BLOCK_N, BLOCK_K//32] scale_b (uint8)
+        out_n = tl.arange(0, BLOCK_N)[:, None]
+        out_kb = tl.arange(0, BLOCK_K // VEC)[None, :]
+
+        n_idx = out_n // 128
+        rem_n = out_n % 128
+        i4a_b = rem_n // 32
+        i32_b = rem_n % 32
+        k_idx_b = out_kb // 4
+        i4b_b = out_kb % 4
+        flat_b = i32_b * 16 + i4a_b * 4 + i4b_b
+        d3_b = flat_b // 256
+        d4_b = flat_b % 256
+
+        sb_ptrs = (
+            b_scale_ptr
+            + (scale_n0 + n_idx) * b_scale_stride_n
+            + (scale_k0 + k_idx_b) * b_scale_stride_k
+            + d3_b * b_scale_stride_dim3
+            + d4_b * b_scale_stride_dim4
         )
+        sb_mask = ((scale_n0 + n_idx) < SCALE_N_DIM) & ((scale_k0 + k_idx_b) < SCALE_K_DIM)
+        scale_b = tl.load(sb_ptrs, mask=sb_mask, other=0).to(tl.uint8)
 
-        accumulator = tl.dot_scaled(
-            a, scale_a, "e4m3", b.T, scale_b, "e4m3", accumulator
-        )
+        acc = tl.dot_scaled(a, scale_a, "e4m3", tl.trans(b), scale_b, "e4m3", acc)
 
-        offs_k_a += BLOCK_K
-        offs_k_b += BLOCK_K
-        offs_scale_k += rep_k
-
-    c_desc.store([offs_am, offs_bn], accumulator.to(output_dtype))
+    c_ptrs = c_ptr + offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn
+    tl.store(c_ptrs, acc.to(out_dtype), mask=(offs_am[:, None] < M) & (offs_bn[None, :] < N))
 
 
 # Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
+_mxfp8_block_scaled_matmul_autotune = triton.autotune(
+    configs=[
+        triton.Config(
+            kwargs={"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k, "NUM_STAGES": num_stages},
+            num_warps=num_warps,
+        )
+        for block_m in [64, 128, 256]
+        for block_n in [128, 256, 512]
+        for block_k in [128]  # Only 128 is valid (block_k=64 gives rep_k=0)
+        for num_stages in [2, 3, 4, 5]
+        for num_warps in [4, 8, 16]
+        if block_m % 128 == 0 and block_n % 128 == 0 and block_k % 32 == 0
+    ],
+    key=["M", "N", "K"],
+    use_cuda_graph=True,
+)
+
+
+_mxfp8_block_scaled_matmul_kernel_autotuned = _mxfp8_block_scaled_matmul_autotune(
+    _mxfp8_block_scaled_matmul_kernel
+)
+
+
 def mxfp8_block_scaled_matmul_triton(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -1271,8 +1331,9 @@ def mxfp8_block_scaled_matmul_triton(
     block_n: int = 256,
     block_k: int = 128,
     num_stages: int = 4,
+    autotune: bool = True,
 ) -> torch.Tensor:
-    """Block-scaled matmul for MXFP8 using Triton dot_scaled."""
+    """Block-scaled matmul for MXFP8 using Triton tl.dot_scaled (no TensorDescriptor)."""
     M, K = a.shape
     N, K_b = b.shape
     assert K == K_b
@@ -1286,42 +1347,83 @@ def mxfp8_block_scaled_matmul_triton(
     else:
         raise ValueError(f"Unsupported output dtype: {output_dtype}")
 
-    rep_m = block_m // 128
-    rep_n = block_n // 128
-    rep_k = block_k // 32 // 4
+    # Ensure contiguous for simple strides (recommended)
+    a = a.contiguous()
+    b = b.contiguous()
+    a_scale = a_scale.contiguous()
+    b_scale = b_scale.contiguous()
 
-    a_desc = TensorDescriptor.from_tensor(a, [block_m, block_k])
-    b_desc = TensorDescriptor.from_tensor(b, [block_n, block_k])
+    # Strides
+    stride_am, stride_ak = a.stride(0), a.stride(1)
+    stride_bn, stride_bk = b.stride(0), b.stride(1)
 
-    scale_block_shape = [1, rep_m, rep_k, 2, 256]
-    a_scale_desc = TensorDescriptor.from_tensor(a_scale, block_shape=scale_block_shape)
-    scale_block_shape = [1, rep_n, rep_k, 2, 256]
-    b_scale_desc = TensorDescriptor.from_tensor(b_scale, block_shape=scale_block_shape)
+    # Scale tensor shape: (1, scale_m, scale_k, 2, 256)
+    # Pass the REAL dims so masking matches the tensor layout exactly
+    scale_m_dim = a_scale.shape[1]
+    scale_k_dim = a_scale.shape[2]
+    scale_n_dim = b_scale.shape[1]
+    # sanity
+    assert a_scale.shape[0] == 1 and a_scale.shape[3] == 2 and a_scale.shape[4] == 256
+    assert b_scale.shape[0] == 1 and b_scale.shape[3] == 2 and b_scale.shape[4] == 256
+    assert b_scale.shape[2] == scale_k_dim
 
-    output = torch.empty((M, N), dtype=output_dtype, device=a.device)
-    c_desc = TensorDescriptor.from_tensor(output, [block_m, block_n])
+    a_scale_stride_m = a_scale.stride(1)
+    a_scale_stride_k = a_scale.stride(2)
+    a_scale_stride_dim3 = a_scale.stride(3)
+    a_scale_stride_dim4 = a_scale.stride(4)
 
-    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), 1)
-    _mxfp8_block_scaled_matmul_kernel[grid](
-        a_desc,
-        a_scale_desc,
-        b_desc,
-        b_scale_desc,
-        c_desc,
-        M,
-        N,
-        K,
-        output_type,
-        block_m,
-        block_n,
-        block_k,
-        rep_m,
-        rep_n,
-        rep_k,
-        num_stages,
-    )
-    return output
+    b_scale_stride_n = b_scale.stride(1)
+    b_scale_stride_k = b_scale.stride(2)
+    b_scale_stride_dim3 = b_scale.stride(3)
+    b_scale_stride_dim4 = b_scale.stride(4)
 
+    # Output
+    out = torch.empty((M, N), dtype=output_dtype, device=a.device)
+    stride_cm, stride_cn = out.stride(0), out.stride(1)
+
+    if autotune:
+        # Expect you defined an autotuned wrapper like:
+        # _mxfp8_block_scaled_matmul_kernel_autotuned = triton.autotune(...)(_mxfp8_block_scaled_matmul_kernel)
+        kernel = _mxfp8_block_scaled_matmul_kernel_autotuned
+
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+            1,
+        )
+
+        kernel[grid](
+            a, a_scale, b, b_scale, out,
+            M, N, K,
+            scale_m_dim, scale_n_dim, scale_k_dim,
+            output_type,
+            stride_am, stride_ak,
+            stride_bn, stride_bk,
+            stride_cm, stride_cn,
+            a_scale_stride_m, a_scale_stride_k, a_scale_stride_dim3, a_scale_stride_dim4,
+            b_scale_stride_n, b_scale_stride_k, b_scale_stride_dim3, b_scale_stride_dim4,
+            # BLOCK_M/BLOCK_N/BLOCK_K/NUM_STAGES come from autotune meta
+        )
+    else:
+        kernel = _mxfp8_block_scaled_matmul_kernel
+        grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), 1)
+
+        kernel[grid](
+            a, a_scale, b, b_scale, out,
+            M, N, K,
+            scale_m_dim, scale_n_dim, scale_k_dim,
+            output_type,
+            stride_am, stride_ak,
+            stride_bn, stride_bk,
+            stride_cm, stride_cn,
+            a_scale_stride_m, a_scale_stride_k, a_scale_stride_dim3, a_scale_stride_dim4,
+            b_scale_stride_n, b_scale_stride_k, b_scale_stride_dim3, b_scale_stride_dim4,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            NUM_STAGES=num_stages,
+        )
+
+    return out
 
 @triton.jit
 def _per_tensor_quant_mla_fp8_stage1(
