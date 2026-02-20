@@ -1232,56 +1232,26 @@ def _mxfp8_block_scaled_matmul_kernel(
     REP_N: tl.constexpr = BLOCK_N // 128
     REP_K: tl.constexpr = BLOCK_K // 128
 
-    # ---------------------------
-    # Precompute scale index maps
-    # ---------------------------
-
-    # A-side: out_m/out_k grid
-    out_m = offs_m[:, None]  # [BM,1]
-    out_k = tl.arange(0, BLOCK_K // VEC)[None, :]  # [1,BK/32]
-
-    m_idx = out_m // 128
-    rem_m = out_m % 128
-    i4a = rem_m // 32
-    i32 = rem_m % 32
-
-    k_idx_base = out_k // 4
-    i4b = out_k % 4
-
-    flat = i32 * 16 + i4a * 4 + i4b  # [BM, BK/32] in [0,511]
-    d3 = flat // 256
-    d4 = flat % 256
-
-    # B-side: out_n/out_k grid
-    out_n = offs_n[:, None]  # [BN,1]
-    out_kb = tl.arange(0, BLOCK_K // VEC)[None, :]
-
-    n_idx = out_n // 128
-    rem_n = out_n % 128
-    i4a_b = rem_n // 32
-    i32_b = rem_n % 32
-
-    k_idx_base_b = out_kb // 4
-    i4b_b = out_kb % 4
-
-    flat_b = i32_b * 16 + i4a_b * 4 + i4b_b
-    d3_b = flat_b // 256
-    d4_b = flat_b % 256
-
-    # scale offsets in (scale_m/scale_n) coordinates are constant per pid
+    # Scale offsets in (scale_m/scale_n) coordinates are constant per pid
     scale_m0 = pid_m * REP_M
     scale_n0 = pid_n * REP_N
+
+    # Precompute masks (don't depend on K loop iteration)
+    out_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+    a_mask_m = offs_am[:, None] < M  # Reused in loop
+    b_mask_n = offs_bn[:, None] < N   # Reused in loop
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
 
     for kk in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=NUM_STAGES):
         k_ids = kk * BLOCK_K + offs_k
+        k_mask = k_ids[None, :] < K  # K dimension mask
 
         # FP8 blocks
         a_ptrs = a_ptr + offs_am[:, None] * stride_am + k_ids[None, :] * stride_ak
         b_ptrs = b_ptr + offs_bn[:, None] * stride_bn + k_ids[None, :] * stride_bk
-        a = tl.load(a_ptrs, mask=(offs_am[:, None] < M) & (k_ids[None, :] < K), other=0.0)
-        b = tl.load(b_ptrs, mask=(offs_bn[:, None] < N) & (k_ids[None, :] < K), other=0.0)
+        a = tl.load(a_ptrs, mask=a_mask_m & k_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask_n & k_mask, other=0.0)
 
         # Only this depends on kk
         scale_k0 = kk * REP_K
@@ -1323,21 +1293,22 @@ def _mxfp8_block_scaled_matmul_kernel(
         acc = tl.dot_scaled(a, scale_a, "e4m3", tl.trans(b), scale_b, "e4m3", acc)
 
     c_ptrs = c_ptr + offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn
-    tl.store(c_ptrs, acc.to(out_dtype), mask=(offs_am[:, None] < M) & (offs_bn[None, :] < N))
+    tl.store(c_ptrs, acc.to(out_dtype), mask=out_mask)
 
 
 # Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
+# Optimized: expanded autotune space for better performance
 _mxfp8_block_scaled_matmul_autotune = triton.autotune(
     configs=[
         triton.Config(
             kwargs={"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k, "NUM_STAGES": num_stages},
             num_warps=num_warps,
         )
-        for block_m in [64, 128, 256]
-        for block_n in [128, 256, 512]
+        for block_m in [128, 256]  # Removed 64 as it's less efficient
+        for block_n in [128, 256, 512, 1024]  # Added 1024 for larger N
         for block_k in [128]  # Only 128 is valid (block_k=64 gives rep_k=0)
-        for num_stages in [2, 3, 4, 5]
-        for num_warps in [4, 8, 16]
+        for num_stages in [2, 3, 4, 5, 6]  # Added 6 for better pipelining on large K
+        for num_warps in [4, 8, 16, 32]  # Added 32 for larger blocks
         if block_m % 128 == 0 and block_n % 128 == 0 and block_k % 32 == 0
     ],
     key=["M", "N", "K"],
