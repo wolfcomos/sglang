@@ -1191,7 +1191,7 @@ def w8a8_block_fp8_matmul(
 
 # Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
 @triton.jit
-def _mxfp8_block_scaled_matmul_kernel(  #
+def _mxfp8_block_scaled_matmul_kernel(
     a_ptr, a_scale_ptr, b_ptr, b_scale_ptr, c_ptr,
     M, N, K,
     SCALE_M_DIM, SCALE_N_DIM, SCALE_K_DIM,
@@ -1204,9 +1204,12 @@ def _mxfp8_block_scaled_matmul_kernel(  #
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
-    if output_type == 0: out_dtype = tl.float32
-    elif output_type == 1: out_dtype = tl.float16
-    else: out_dtype = tl.bfloat16
+    if output_type == 0:
+        out_dtype = tl.float32
+    elif output_type == 1:
+        out_dtype = tl.float16
+    else:
+        out_dtype = tl.bfloat16
 
     tl.static_assert(BLOCK_K % 32 == 0)
     tl.static_assert(BLOCK_M % 128 == 0)
@@ -1217,14 +1220,57 @@ def _mxfp8_block_scaled_matmul_kernel(  #
     pid_m = pid % num_pid_m
     pid_n = pid // num_pid_m
 
-    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k  = tl.arange(0, BLOCK_K)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    offs_am = pid_m * BLOCK_M + offs_m
+    offs_bn = pid_n * BLOCK_N + offs_n
 
     VEC: tl.constexpr = 32
-    rep_m = BLOCK_M // 128
-    rep_n = BLOCK_N // 128
-    rep_k = BLOCK_K // 128  # since rep_k in tutorial is BLOCK_K/(32*4) = BLOCK_K/128
+    REP_M: tl.constexpr = BLOCK_M // 128
+    REP_N: tl.constexpr = BLOCK_N // 128
+    REP_K: tl.constexpr = BLOCK_K // 128
+
+    # ---------------------------
+    # Precompute scale index maps
+    # ---------------------------
+
+    # A-side: out_m/out_k grid
+    out_m = offs_m[:, None]  # [BM,1]
+    out_k = tl.arange(0, BLOCK_K // VEC)[None, :]  # [1,BK/32]
+
+    m_idx = out_m // 128
+    rem_m = out_m % 128
+    i4a = rem_m // 32
+    i32 = rem_m % 32
+
+    k_idx_base = out_k // 4
+    i4b = out_k % 4
+
+    flat = i32 * 16 + i4a * 4 + i4b  # [BM, BK/32] in [0,511]
+    d3 = flat // 256
+    d4 = flat % 256
+
+    # B-side: out_n/out_k grid
+    out_n = offs_n[:, None]  # [BN,1]
+    out_kb = tl.arange(0, BLOCK_K // VEC)[None, :]
+
+    n_idx = out_n // 128
+    rem_n = out_n % 128
+    i4a_b = rem_n // 32
+    i32_b = rem_n % 32
+
+    k_idx_base_b = out_kb // 4
+    i4b_b = out_kb % 4
+
+    flat_b = i32_b * 16 + i4a_b * 4 + i4b_b
+    d3_b = flat_b // 256
+    d4_b = flat_b % 256
+
+    # scale offsets in (scale_m/scale_n) coordinates are constant per pid
+    scale_m0 = pid_m * REP_M
+    scale_n0 = pid_n * REP_N
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
 
@@ -1237,58 +1283,42 @@ def _mxfp8_block_scaled_matmul_kernel(  #
         a = tl.load(a_ptrs, mask=(offs_am[:, None] < M) & (k_ids[None, :] < K), other=0.0)
         b = tl.load(b_ptrs, mask=(offs_bn[:, None] < N) & (k_ids[None, :] < K), other=0.0)
 
-        # scale offsets in (scale_m/scale_n, scale_k) coordinates
-        scale_m0 = pid_m * rep_m
-        scale_n0 = pid_n * rep_n
-        scale_k0 = kk * rep_k  # each BLOCK_K corresponds to rep_k scale-k steps
+        # Only this depends on kk
+        scale_k0 = kk * REP_K
 
-        # Load [BLOCK_M, BLOCK_K//32] scale_a (uint8)
-        out_m = tl.arange(0, BLOCK_M)[:, None]
-        out_k = tl.arange(0, BLOCK_K // VEC)[None, :]
-
-        m_idx = out_m // 128
-        rem_m = out_m % 128
-        i4a  = rem_m // 32
-        i32  = rem_m % 32
-        k_idx = out_k // 4
-        i4b  = out_k % 4
-        flat = i32 * 16 + i4a * 4 + i4b
-        d3 = flat // 256
-        d4 = flat % 256
-
-        sa_ptrs = (
-            a_scale_ptr
-            + (scale_m0 + m_idx) * a_scale_stride_m
-            + (scale_k0 + k_idx) * a_scale_stride_k
-            + d3 * a_scale_stride_dim3
-            + d4 * a_scale_stride_dim4
+        # A packed block load: a_scale[0, scale_m0:scale_m0+rep_m, scale_k0:scale_k0+rep_k, :, :]
+        a_scale_blk_ptr = tl.make_block_ptr(
+            base=a_scale_ptr,
+            shape=(SCALE_M_DIM, SCALE_K_DIM, 2, 256),
+            strides=(a_scale_stride_m, a_scale_stride_k, a_scale_stride_dim3, a_scale_stride_dim4),
+            offsets=(scale_m0, scale_k0, 0, 0),
+            block_shape=(BLOCK_M // 128, BLOCK_K // 128, 2, 256),
+            order=(3, 2, 1, 0),
         )
-        sa_mask = ((scale_m0 + m_idx) < SCALE_M_DIM) & ((scale_k0 + k_idx) < SCALE_K_DIM)
-        scale_a = tl.load(sa_ptrs, mask=sa_mask, other=0).to(tl.uint8)
+        scale_a_blk = tl.load(a_scale_blk_ptr, boundary_check=(0, 1), padding_option="zero")
 
-        # Load [BLOCK_N, BLOCK_K//32] scale_b (uint8)
-        out_n = tl.arange(0, BLOCK_N)[:, None]
-        out_kb = tl.arange(0, BLOCK_K // VEC)[None, :]
-
-        n_idx = out_n // 128
-        rem_n = out_n % 128
-        i4a_b = rem_n // 32
-        i32_b = rem_n % 32
-        k_idx_b = out_kb // 4
-        i4b_b = out_kb % 4
-        flat_b = i32_b * 16 + i4a_b * 4 + i4b_b
-        d3_b = flat_b // 256
-        d4_b = flat_b % 256
-
-        sb_ptrs = (
-            b_scale_ptr
-            + (scale_n0 + n_idx) * b_scale_stride_n
-            + (scale_k0 + k_idx_b) * b_scale_stride_k
-            + d3_b * b_scale_stride_dim3
-            + d4_b * b_scale_stride_dim4
+        # B packed block load: b_scale[0, scale_n0:scale_n0+rep_n, scale_k0:scale_k0+rep_k, :, :]
+        b_scale_blk_ptr = tl.make_block_ptr(
+            base=b_scale_ptr,
+            shape=(SCALE_N_DIM, SCALE_K_DIM, 2, 256),
+            strides=(b_scale_stride_n, b_scale_stride_k, b_scale_stride_dim3, b_scale_stride_dim4),
+            offsets=(scale_n0, scale_k0, 0, 0),
+            block_shape=(BLOCK_N // 128, BLOCK_K // 128, 2, 256),
+            order=(3, 2, 1, 0),
         )
-        sb_mask = ((scale_n0 + n_idx) < SCALE_N_DIM) & ((scale_k0 + k_idx_b) < SCALE_K_DIM)
-        scale_b = tl.load(sb_ptrs, mask=sb_mask, other=0).to(tl.uint8)
+        scale_b_blk = tl.load(b_scale_blk_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        # reshape/trans/reshape exactly like tutorial
+        scale_a = (
+            scale_a_blk.reshape(REP_M, REP_K, 32, 4, 4)
+                    .trans(0, 3, 2, 1, 4)
+                    .reshape(BLOCK_M, BLOCK_K // VEC)
+        )
+        scale_b = (
+            scale_b_blk.reshape(REP_N, REP_K, 32, 4, 4)
+                    .trans(0, 3, 2, 1, 4)
+                    .reshape(BLOCK_N, BLOCK_K // VEC)
+        )
 
         acc = tl.dot_scaled(a, scale_a, "e4m3", tl.trans(b), scale_b, "e4m3", acc)
 
@@ -1311,7 +1341,7 @@ _mxfp8_block_scaled_matmul_autotune = triton.autotune(
         if block_m % 128 == 0 and block_n % 128 == 0 and block_k % 32 == 0
     ],
     key=["M", "N", "K"],
-    use_cuda_graph=True,
+    use_cuda_graph=False,
 )
 
 

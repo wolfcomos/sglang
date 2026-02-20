@@ -140,18 +140,30 @@ def benchmark(M, N, K, provider):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == "mxfp8_triton":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        # Note: Using autotune=True will use Triton's cached autotuned configuration.
+        # The autotuner caches the best config per (M, N, K) tuple, so once autotuned,
+        # subsequent calls use the same cached config, leading to consistent timings.
+        #
+        # Why some timings are identical across different M values:
+        # - The autotuner may select the same optimal config (e.g., BLOCK_M=128) for
+        #   different M values when N and K are the same
+        # - Very fast operations may have timing differences below measurement precision
+        # - The autotuner cache persists across runs (via TRITON_CACHE_DIR if set)
+        #
+        # To see variation or force re-autotuning, you can:
+        # - Clear the Triton cache: rm -rf ~/.triton/cache (or TRITON_CACHE_DIR)
+        # - Use autotune=False with different block sizes to compare configs manually
+        ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: mxfp8_block_scaled_matmul_triton(
                 q_input,
                 a_scale_packed,
                 weight_q,
                 b_scale_packed,
                 output_dtype=torch.bfloat16,
-                block_m=block_m,
-                block_n=block_n,
-                block_k=block_k,
-                num_stages=4,
+                autotune=True,
             ),
+            warmup=200,
+            rep=500,
             quantiles=quantiles,
         )
 
