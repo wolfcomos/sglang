@@ -1298,7 +1298,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         if nvfp4_online_input_scale_enabled():
             input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
-            # Rebuild alpha from checkpoint weight scale and current input scale.
             layer.alpha.copy_(
                 (layer.gemm_weight_scale * input_scale).expand_as(layer.alpha)
             )

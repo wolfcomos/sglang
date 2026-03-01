@@ -1140,8 +1140,6 @@ class FlashInferFP4MoE(FusedMoE):
         if self.moe_runner_config.is_gated and w13_weight_scale_runtime.dim() > 1:
             w13_weight_scale_runtime = w13_weight_scale_runtime[:, 0]
 
-        # Stateless online mode:
-        # keep checkpoint weight scale fixed and only apply current input scale.
         self.g1_alphas.data.copy_(
             (w13_weight_scale_runtime * input_scale).expand_as(self.g1_alphas)
         )
