@@ -1193,6 +1193,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         copy_or_rebind_param(
             layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
+
         if nvfp4_online_input_scale_enabled():
             copy_or_rebind_param(
                 layer, "gemm_weight_scale", weight_scale_2.to(torch.float32)
@@ -1298,8 +1299,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if nvfp4_online_input_scale_enabled():
             input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
             # Rebuild alpha from checkpoint weight scale and current input scale.
-            layer.alpha.copy_(layer.gemm_weight_scale.expand_as(layer.alpha))
-            layer.alpha.mul_(input_scale)
+            layer.alpha.copy_(
+                (layer.gemm_weight_scale * input_scale).expand_as(layer.alpha)
+            )
             layer.input_scale_inv.copy_(
                 input_scale_inv.expand_as(layer.input_scale_inv)
             )
@@ -1745,11 +1747,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation in ACT_STR_TO_TYPE_MAP
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
-        # Keep loader-owned weight-scale params untouched; use a selected runtime view.
-        w1_weight_scale_runtime = layer.w13_weight_scale_2
-        if layer.moe_runner_config.is_gated and w1_weight_scale_runtime.dim() > 1:
-            w1_weight_scale_runtime = w1_weight_scale_runtime[:, 0]
-        w2_weight_scale_runtime = layer.w2_weight_scale_2
+
+        w1_weight_scale, w2_weight_scale = None, None
+        if nvfp4_online_input_scale_enabled():
+            # Keep loader-owned weight-scale params untouched; use a selected runtime view.
+            w1_weight_scale = layer.w13_weight_scale_2
+            if layer.moe_runner_config.is_gated and w1_weight_scale.dim() > 1:
+                w1_weight_scale = w1_weight_scale[:, 0]
+            w2_weight_scale = layer.w2_weight_scale_2
 
         # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
         # backend is flashinfer_trtllm
@@ -1792,18 +1797,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
             if nvfp4_online_input_scale_enabled():
-                input_scale_inv = layer.w13_input_scale_quant
-                input_scale = torch.where(
-                    input_scale_inv > 0,
-                    1.0 / input_scale_inv,
-                    input_scale_inv,
-                )
-                # Stateless online mode:
-                # keep checkpoint weight scale fixed and only apply current input scale.
+                assert w1_weight_scale is not None
+                if x_sf is None:
+                    # No pre-quantized activations from dispatcher: compute from current batch.
+                    input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+                    layer.w13_input_scale_quant.copy_(
+                        input_scale_inv.expand_as(layer.w13_input_scale_quant)
+                    )
+                else:
+                    # Pre-quantized path: dispatcher already wrote current-batch scale.
+                    input_scale_inv = layer.w13_input_scale_quant
+                    input_scale = 1.0 / input_scale_inv
                 layer.g1_alphas.copy_(
-                    w1_weight_scale_runtime.expand_as(layer.g1_alphas)
+                    (w1_weight_scale * input_scale).expand_as(layer.g1_alphas)
                 )
-                layer.g1_alphas.mul_(input_scale)
 
             output_dtype = torch.bfloat16
 
@@ -1865,16 +1872,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w1_fp4=layer.w13_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,
             w1_alphas=layer.g1_alphas,
-            w1_weight_scale=w1_weight_scale_runtime,
             a2_gscale=layer.w2_input_scale_quant,
             w2_fp4=layer.w2_weight,
             w2_blockscale=layer.w2_blockscale_swizzled,
             w2_alphas=layer.g2_alphas,
-            w2_weight_scale=w2_weight_scale_runtime,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+            w1_weight_scale=w1_weight_scale,
+            w2_weight_scale=w2_weight_scale,
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput

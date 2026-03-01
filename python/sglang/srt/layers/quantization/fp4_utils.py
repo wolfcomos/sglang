@@ -53,11 +53,12 @@ class Fp4GemmRunnerBackend(Enum):
 
 
 FP4_GEMM_RUNNER_BACKEND: Fp4GemmRunnerBackend | None = None
+NVFP4_ONLINE_INPUT_SCALE_ENABLED: bool | None = None
 
 
 def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
     """Initialize FP4 GEMM configuration from server args."""
-    global FP4_GEMM_RUNNER_BACKEND
+    global FP4_GEMM_RUNNER_BACKEND, NVFP4_ONLINE_INPUT_SCALE_ENABLED
 
     backend = server_args.fp4_gemm_runner_backend
 
@@ -80,7 +81,16 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
                 "Using server argument value."
             )
 
+    if envs.SGLANG_NVFP4_ONLINE_INPUT_SCALE.is_set():
+        env_online_input_scale = envs.SGLANG_NVFP4_ONLINE_INPUT_SCALE.get()
+        if env_online_input_scale:
+            logger.warning(
+                "SGLANG_NVFP4_ONLINE_INPUT_SCALE is experimental. "
+                "Accuracy is not guaranteed."
+            )
+
     FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend(backend)
+    NVFP4_ONLINE_INPUT_SCALE_ENABLED = envs.SGLANG_NVFP4_ONLINE_INPUT_SCALE.get()
 
 
 def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
@@ -93,15 +103,18 @@ def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
 
 def nvfp4_online_input_scale_enabled() -> bool:
     """Whether to compute NVFP4 input scales online from activations."""
-    return envs.SGLANG_NVFP4_ONLINE_INPUT_SCALE.get()
+    global NVFP4_ONLINE_INPUT_SCALE_ENABLED
+    if NVFP4_ONLINE_INPUT_SCALE_ENABLED is None:
+        NVFP4_ONLINE_INPUT_SCALE_ENABLED = envs.SGLANG_NVFP4_ONLINE_INPUT_SCALE.get()
+    return NVFP4_ONLINE_INPUT_SCALE_ENABLED
 
 
 def nvfp4_compute_input_scale_and_inv(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.numel() == 0:
-        input_scale = x.new_tensor(0.0, dtype=torch.float32)
-        input_scale_inv = x.new_tensor(0.0, dtype=torch.float32)
+        input_scale = x.new_tensor(1.0, dtype=torch.float32)
+        input_scale_inv = x.new_tensor(1.0, dtype=torch.float32)
         return input_scale, input_scale_inv
 
     global_amax = x.abs().max().to(torch.float32)

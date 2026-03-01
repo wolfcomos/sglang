@@ -146,13 +146,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
         if nvfp4_online_input_scale_enabled():
             input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
-            layer.alpha.copy_(
-                torch.where(
-                    layer.weight_global_scale > 0,
-                    input_scale / layer.weight_global_scale,
-                    layer.weight_global_scale,
-                )
-            )
+            layer.alpha.copy_(input_scale / layer.weight_global_scale)
             layer.input_global_scale.copy_(
                 input_scale_inv.expand_as(layer.input_global_scale)
             )

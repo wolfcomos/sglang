@@ -354,10 +354,7 @@ def _apply_nvfp4_online_input_scale_inplace(
 ) -> None:
     """Apply online NVFP4 input scaling for one GEMM stage in-place."""
     input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
-    # Stateless online mode:
-    # keep checkpoint weight scale fixed and only apply current input scale.
-    w_alphas.copy_(w_weight_scale.expand_as(w_alphas))
-    w_alphas.mul_(input_scale)
+    w_alphas.copy_((w_weight_scale * input_scale).expand_as(w_alphas))
     a_gscale.copy_(input_scale_inv.expand_as(a_gscale))
 
 
@@ -367,16 +364,16 @@ def cutlass_moe_fp4(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
     w1_alphas: torch.Tensor,
-    w1_weight_scale: torch.Tensor,
     a2_gscale: torch.Tensor,
     w2_fp4: torch.Tensor,
     w2_blockscale: torch.Tensor,
     w2_alphas: torch.Tensor,
-    w2_weight_scale: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
+    w1_weight_scale: Optional[torch.Tensor] = None,
+    w2_weight_scale: Optional[torch.Tensor] = None,
 ):
     """
     MoE implementation for FP4 Inputs
@@ -467,6 +464,9 @@ def cutlass_moe_fp4(
     )
 
     if nvfp4_online_input_scale_enabled():
+        assert (
+            w1_weight_scale is not None
+        ), "w1_weight_scale is required when SGLANG_NVFP4_ONLINE_INPUT_SCALE=1"
         _apply_nvfp4_online_input_scale_inplace(
             a, a1_gscale, w1_alphas, w1_weight_scale
         )
@@ -498,6 +498,9 @@ def cutlass_moe_fp4(
     silu_and_mul(c1, intermediate)
 
     if nvfp4_online_input_scale_enabled():
+        assert (
+            w2_weight_scale is not None
+        ), "w2_weight_scale is required when SGLANG_NVFP4_ONLINE_INPUT_SCALE=1"
         _apply_nvfp4_online_input_scale_inplace(
             intermediate, a2_gscale, w2_alphas, w2_weight_scale
         )

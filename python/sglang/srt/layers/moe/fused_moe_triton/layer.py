@@ -1142,8 +1142,9 @@ class FlashInferFP4MoE(FusedMoE):
 
         # Stateless online mode:
         # keep checkpoint weight scale fixed and only apply current input scale.
-        self.g1_alphas.data.copy_(w13_weight_scale_runtime.expand_as(self.g1_alphas))
-        self.g1_alphas.data.mul_(input_scale)
+        self.g1_alphas.data.copy_(
+            (w13_weight_scale_runtime * input_scale).expand_as(self.g1_alphas)
+        )
         self.w13_input_scale_quant.copy_(
             input_scale_inv.expand_as(self.w13_input_scale_quant)
         )
