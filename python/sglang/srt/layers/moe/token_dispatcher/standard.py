@@ -32,7 +32,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.fp4_utils import (
     nvfp4_compute_input_scale_and_inv,
-    nvfp4_online_scale_enabled,
+    nvfp4_online_input_scale_enabled,
 )
 from sglang.srt.utils.common import get_bool_env_var, is_hip, is_sm120_supported
 
@@ -107,11 +107,12 @@ class StandardDispatcher(BaseDispatcher):
             from flashinfer import nvfp4_block_scale_interleave
 
             global_scale = self.quant_config.get("input_global_scale", None)
-            if nvfp4_online_scale_enabled():
-                _, global_scale = nvfp4_compute_input_scale_and_inv(hidden_states)
-                self.last_input_scale_inv = global_scale
-            else:
-                self.last_input_scale_inv = None
+            if nvfp4_online_input_scale_enabled():
+                _, input_scale_inv = nvfp4_compute_input_scale_and_inv(hidden_states)
+                assert (
+                    global_scale is not None
+                ), "input_global_scale is not set for NVFP4 online input scale"
+                global_scale.copy_(input_scale_inv.expand_as(global_scale))
             assert global_scale is not None, "input_global_scale is not set"
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 

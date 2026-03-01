@@ -7,7 +7,7 @@ import torch
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
 from sglang.srt.layers.quantization.fp4_utils import (
     nvfp4_compute_input_scale_and_inv,
-    nvfp4_online_scale_enabled,
+    nvfp4_online_input_scale_enabled,
 )
 from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
@@ -346,16 +346,33 @@ FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
 
 
+def _apply_nvfp4_online_input_scale_inplace(
+    x: torch.Tensor,
+    a_gscale: torch.Tensor,
+    w_alphas: torch.Tensor,
+    w_weight_scale: torch.Tensor,
+) -> None:
+    """Apply online NVFP4 input scaling for one GEMM stage in-place."""
+    input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+    # Stateless online mode:
+    # keep checkpoint weight scale fixed and only apply current input scale.
+    w_alphas.copy_(w_weight_scale.expand_as(w_alphas))
+    w_alphas.mul_(input_scale)
+    a_gscale.copy_(input_scale_inv.expand_as(a_gscale))
+
+
 def cutlass_moe_fp4(
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
     w1_alphas: torch.Tensor,
+    w1_weight_scale: torch.Tensor,
     a2_gscale: torch.Tensor,
     w2_fp4: torch.Tensor,
     w2_blockscale: torch.Tensor,
     w2_alphas: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     params: CutlassMoEParams,
@@ -449,24 +466,10 @@ def cutlass_moe_fp4(
         params.blockscale_offsets,
     )
 
-    if nvfp4_online_scale_enabled():
-        orig_a1_gscale = a1_gscale
-        orig_w1_alphas = w1_alphas
-        input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(a)
-        if hasattr(params, "online_a1_gscale"):
-            params.online_a1_gscale.copy_(
-                input_scale_inv.expand_as(params.online_a1_gscale)
-            )
-            a1_gscale = params.online_a1_gscale
-        else:
-            a1_gscale = torch.full_like(orig_a1_gscale, input_scale_inv)
-        if hasattr(params, "online_w1_alphas"):
-            params.online_w1_alphas.copy_(orig_w1_alphas)
-            params.online_w1_alphas.mul_(orig_a1_gscale)
-            params.online_w1_alphas.mul_(input_scale)
-            w1_alphas = params.online_w1_alphas
-        else:
-            w1_alphas = input_scale * (orig_w1_alphas * orig_a1_gscale)
+    if nvfp4_online_input_scale_enabled():
+        _apply_nvfp4_online_input_scale_inplace(
+            a, a1_gscale, w1_alphas, w1_weight_scale
+        )
 
     rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
         a,
@@ -494,24 +497,10 @@ def cutlass_moe_fp4(
     )
     silu_and_mul(c1, intermediate)
 
-    if nvfp4_online_scale_enabled():
-        orig_a2_gscale = a2_gscale
-        orig_w2_alphas = w2_alphas
-        int_scale, int_scale_inv = nvfp4_compute_input_scale_and_inv(intermediate)
-        if hasattr(params, "online_a2_gscale"):
-            params.online_a2_gscale.copy_(
-                int_scale_inv.expand_as(params.online_a2_gscale)
-            )
-            a2_gscale = params.online_a2_gscale
-        else:
-            a2_gscale = torch.full_like(orig_a2_gscale, int_scale_inv)
-        if hasattr(params, "online_w2_alphas"):
-            params.online_w2_alphas.copy_(orig_w2_alphas)
-            params.online_w2_alphas.mul_(orig_a2_gscale)
-            params.online_w2_alphas.mul_(int_scale)
-            w2_alphas = params.online_w2_alphas
-        else:
-            w2_alphas = int_scale * (orig_w2_alphas * orig_a2_gscale)
+    if nvfp4_online_input_scale_enabled():
+        _apply_nvfp4_online_input_scale_inplace(
+            intermediate, a2_gscale, w2_alphas, w2_weight_scale
+        )
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,

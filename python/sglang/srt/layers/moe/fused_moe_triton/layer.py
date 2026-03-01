@@ -58,7 +58,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp4_utils import (
     nvfp4_compute_input_scale_and_inv,
-    nvfp4_online_scale_enabled,
+    nvfp4_online_input_scale_enabled,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
@@ -1131,14 +1131,28 @@ class FlashInferFP4MoE(FusedMoE):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def _apply_nvfp4_online_input_scale_inplace(
+        self, hidden_states: torch.Tensor
+    ) -> None:
+        """Apply online NVFP4 input scaling in-place on cached tensors."""
+        input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(hidden_states)
+        w13_weight_scale_runtime = self.w13_weight_scale_2
+        if self.moe_runner_config.is_gated and w13_weight_scale_runtime.dim() > 1:
+            w13_weight_scale_runtime = w13_weight_scale_runtime[:, 0]
+
+        # Stateless online mode:
+        # keep checkpoint weight scale fixed and only apply current input scale.
+        self.g1_alphas.data.copy_(w13_weight_scale_runtime.expand_as(self.g1_alphas))
+        self.g1_alphas.data.mul_(input_scale)
+        self.w13_input_scale_quant.copy_(
+            input_scale_inv.expand_as(self.w13_input_scale_quant)
+        )
+        self.g1_scale_c.data.copy_(self.w2_input_scale_quant * self.g1_alphas.data)
+
     # ---------------------------------------------------------------------
     # Helper: quantize hidden states to FP4 each forward pass
     # ---------------------------------------------------------------------
-    def _quantize_hidden_states_fp4(
-        self,
-        hidden_states: torch.Tensor,
-        input_scale_override: Optional[torch.Tensor] = None,
-    ):
+    def _quantize_hidden_states_fp4(self, hidden_states: torch.Tensor):
         """
         Quantize hidden states using global scale factor from quantization method.
 
@@ -1148,19 +1162,11 @@ class FlashInferFP4MoE(FusedMoE):
         Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime, global_scale_float32)
         """
 
-        input_scale = (
-            input_scale_override
-            if input_scale_override is not None
-            else self.w13_input_scale_quant
-        )
-        if input_scale_override is None and nvfp4_online_scale_enabled():
-            _, input_scale = nvfp4_compute_input_scale_and_inv(hidden_states)
-
         # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
         # Only the block scales are computed at runtime
         hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
             hidden_states,
-            input_scale,
+            self.w13_input_scale_quant,
             16,  # sf_vec_size
             False,  # use_ue8m0
             False,  # is_sf_swizzled_layout
@@ -1211,25 +1217,9 @@ class FlashInferFP4MoE(FusedMoE):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
 
-        g1_alphas = self.g1_alphas.data
-        g1_scale_c = self.g1_scale_c.data
-        if nvfp4_online_scale_enabled():
-            input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(
-                hidden_states
-            )
-            hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(
-                hidden_states, input_scale_override=input_scale_inv
-            )
-            weight_scale_2 = self.g1_alphas.data * self.w13_input_scale_quant
-            g1_alphas = input_scale * weight_scale_2
-            w2_input_scale_quant = torch.where(
-                self.g1_alphas != 0,
-                self.g1_scale_c / self.g1_alphas,
-                self.g1_scale_c,
-            )
-            g1_scale_c = w2_input_scale_quant * g1_alphas
-        else:
-            hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(hidden_states)
+        if nvfp4_online_input_scale_enabled():
+            self._apply_nvfp4_online_input_scale_inplace(hidden_states)
+        hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(hidden_states)
         routing_method_type = self.routing_method_type
         assert (
             routing_method_type is not None
@@ -1277,8 +1267,8 @@ class FlashInferFP4MoE(FusedMoE):
                 torch.float8_e4m3fn
             ),
             gemm2_bias=None,
-            output1_scale_scalar=g1_scale_c,
-            output1_scale_gate_scalar=g1_alphas,
+            output1_scale_scalar=self.g1_scale_c.data,
+            output1_scale_gate_scalar=self.g1_alphas.data,
             output2_scale_scalar=self.g2_alphas.data,
             num_experts=self.num_experts,
             top_k=topk_config.top_k,

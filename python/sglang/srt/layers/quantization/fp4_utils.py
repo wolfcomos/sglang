@@ -91,8 +91,9 @@ def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
     return FP4_GEMM_RUNNER_BACKEND
 
 
-def nvfp4_online_scale_enabled() -> bool:
-    return envs.SGLANG_NVFP4_ONLINE_SCALE.get()
+def nvfp4_online_input_scale_enabled() -> bool:
+    """Whether to compute NVFP4 input scales online from activations."""
+    return envs.SGLANG_NVFP4_ONLINE_INPUT_SCALE.get()
 
 
 def nvfp4_compute_input_scale_and_inv(

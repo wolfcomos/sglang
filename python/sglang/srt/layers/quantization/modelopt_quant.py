@@ -35,7 +35,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp4_utils import (
     get_fp4_gemm_runner_backend,
     nvfp4_compute_input_scale_and_inv,
-    nvfp4_online_scale_enabled,
+    nvfp4_online_input_scale_enabled,
 )
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -44,10 +44,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.unquant import (
-    UnquantizedFusedMoEMethod,
-    UnquantizedLinearMethod,
-)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     is_layer_skipped,
@@ -144,12 +141,6 @@ def fp4_gemm(
     if enable_flashinfer_fp4_gemm:
         # Use the remapping logic to convert SGLang backend names to FlashInfer API names
         backend = fp4_backend.get_flashinfer_backend()
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            if backend in ("auto", "cudnn"):
-                logger.warning_once(
-                    "CUDA graph capture detected: forcing FlashInfer FP4 GEMM backend to cutlass."
-                )
-                backend = "cutlass"
         return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
@@ -310,12 +301,11 @@ class ModelOptQuantConfig(QuantizationConfig):
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
-                return UnquantizedFusedMoEMethod(
-                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
-                )
+            # Check if MoE layer should be excluded from quantization
+            # (e.g., MTP layers that have no quantization scales in checkpoint)
+            if self.is_layer_excluded(prefix):
+                # Falls back to default unquantized MoE
+                return None
             return Moe(self)
         return None
 
@@ -1203,8 +1193,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         copy_or_rebind_param(
             layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
+        if nvfp4_online_input_scale_enabled():
+            copy_or_rebind_param(
+                layer, "gemm_weight_scale", weight_scale_2.to(torch.float32)
+            )
+
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
+
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
@@ -1299,14 +1295,17 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
 
-        # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        input_scale_inv = layer.input_scale_inv
-        alpha = layer.alpha
-        if nvfp4_online_scale_enabled():
+        if nvfp4_online_input_scale_enabled():
             input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
-            alpha = input_scale * layer.weight_scale_2
+            # Rebuild alpha from checkpoint weight scale and current input scale.
+            layer.alpha.copy_(layer.gemm_weight_scale.expand_as(layer.alpha))
+            layer.alpha.mul_(input_scale)
+            layer.input_scale_inv.copy_(
+                input_scale_inv.expand_as(layer.input_scale_inv)
+            )
 
-        x_fp4, x_scale_interleaved = fp4_quantize(x, input_scale_inv)
+        # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
+        x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight.dtype == torch.uint8
@@ -1328,7 +1327,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w,
             x_scale_interleaved,
             w_scale_interleaved,
-            alpha,
+            layer.alpha,
             output_dtype,
             w_n,
         )
@@ -1599,6 +1598,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "input_global_scale": (
                     layer.w13_input_scale_quant
                     if MOE_NVFP4_DISPATCH
+                    or nvfp4_online_input_scale_enabled()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else None
                 )
@@ -1715,12 +1715,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     hidden_size=hidden_size,
                 )  # k
 
-        # Preallocate online-scale buffers to avoid cuda graph capture allocations.
-        layer.nvfp4_online_w13_input_scale_quant = torch.empty_like(
-            layer.w13_input_scale_quant
-        )
-        layer.nvfp4_online_g1_alphas = torch.empty_like(layer.g1_alphas)
-
     @property
     def load_up_proj_weight_first(self) -> bool:
         # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
@@ -1751,6 +1745,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation in ACT_STR_TO_TYPE_MAP
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
+        # Keep loader-owned weight-scale params untouched; use a selected runtime view.
+        w1_weight_scale_runtime = layer.w13_weight_scale_2
+        if layer.moe_runner_config.is_gated and w1_weight_scale_runtime.dim() > 1:
+            w1_weight_scale_runtime = w1_weight_scale_runtime[:, 0]
+        w2_weight_scale_runtime = layer.w2_weight_scale_2
 
         # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
         # backend is flashinfer_trtllm
@@ -1792,37 +1791,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-            w13_input_scale_quant = layer.w13_input_scale_quant
-            g1_alphas = layer.g1_alphas
-            if nvfp4_online_scale_enabled():
-                input_scale_inv = getattr(
-                    layer.dispatcher, "last_input_scale_inv", None
-                )
-                if input_scale_inv is None:
-                    _, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
-                if hasattr(layer, "nvfp4_online_w13_input_scale_quant"):
-                    w13_input_scale_quant = layer.nvfp4_online_w13_input_scale_quant
-                    w13_input_scale_quant.copy_(
-                        input_scale_inv.expand_as(w13_input_scale_quant)
-                    )
-                else:
-                    w13_input_scale_quant = torch.full_like(
-                        layer.w13_input_scale_quant, input_scale_inv
-                    )
+            if nvfp4_online_input_scale_enabled():
+                input_scale_inv = layer.w13_input_scale_quant
                 input_scale = torch.where(
                     input_scale_inv > 0,
                     1.0 / input_scale_inv,
                     input_scale_inv,
                 )
-                if hasattr(layer, "nvfp4_online_g1_alphas"):
-                    g1_alphas = layer.nvfp4_online_g1_alphas
-                    g1_alphas.copy_(layer.g1_alphas)
-                    g1_alphas.mul_(layer.w13_input_scale_quant)
-                    g1_alphas.mul_(input_scale)
-                else:
-                    g1_alphas = input_scale * (
-                        layer.g1_alphas * layer.w13_input_scale_quant
-                    )
+                # Stateless online mode:
+                # keep checkpoint weight scale fixed and only apply current input scale.
+                layer.g1_alphas.copy_(
+                    w1_weight_scale_runtime.expand_as(layer.g1_alphas)
+                )
+                layer.g1_alphas.mul_(input_scale)
 
             output_dtype = torch.bfloat16
 
@@ -1855,9 +1836,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 input_sf=x_sf,
                 # swizzled_input_sf=not get_moe_a2a_backend().is_flashinfer(),
                 quant_scales=[
-                    w13_input_scale_quant,
+                    layer.w13_input_scale_quant,
                     layer.w13_blockscale_swizzled.view(torch.int32),
-                    g1_alphas,
+                    layer.g1_alphas,
                     layer.w2_input_scale_quant,
                     layer.w2_blockscale_swizzled.view(torch.int32),
                     layer.g2_alphas,
@@ -1884,10 +1865,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w1_fp4=layer.w13_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,
             w1_alphas=layer.g1_alphas,
+            w1_weight_scale=w1_weight_scale_runtime,
             a2_gscale=layer.w2_input_scale_quant,
             w2_fp4=layer.w2_weight,
             w2_blockscale=layer.w2_blockscale_swizzled,
             w2_alphas=layer.g2_alphas,
+            w2_weight_scale=w2_weight_scale_runtime,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             params=layer.cutlass_moe_params,
