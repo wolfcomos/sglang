@@ -46,8 +46,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
-_is_sm100_supported = is_sm100_supported() if _is_cuda else False
-_is_sm120_supported = is_sm120_supported() if _is_cuda else False
+_is_sm100_supported = is_sm100_supported()
+_is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
