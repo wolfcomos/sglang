@@ -50,8 +50,8 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
-_is_sm100_supported = is_sm100_supported() if _is_cuda else False
-_is_sm120_supported = is_sm120_supported() if _is_cuda else False
+_is_sm100_supported = is_sm100_supported()
+_is_sm120_supported = is_sm120_supported()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
