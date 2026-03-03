@@ -46,6 +46,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_sm100_supported = is_sm100_supported() if _is_cuda else False
+_is_sm120_supported = is_sm120_supported() if _is_cuda else False
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
@@ -1297,7 +1299,7 @@ def mxfp8_block_scaled_matmul_triton(
             SM120: 1, SM100: 4.
     """
     if num_stages is None:
-        num_stages = 1 if is_sm120_supported() else (4 if is_sm100_supported() else 1)
+        num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
     M, K = a.shape
     N, K_b = b.shape
     assert K == K_b
