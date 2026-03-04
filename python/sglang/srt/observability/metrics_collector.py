@@ -80,9 +80,6 @@ class SchedulerStats:
     num_decode_transfer_queue_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
-    kv_transfer_bootstrap_ms: float = 0.0
-    kv_transfer_alloc_ms: float = 0.0
-    kv_transfer_total_mb: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -100,6 +97,10 @@ class SchedulerStats:
     lora_pool_slots_used: int = 0
     lora_pool_slots_total: int = 0
     lora_pool_utilization: float = 0.0
+
+    # HiCache metrics
+    hicache_host_used_tokens: int = 0
+    hicache_host_total_tokens: int = 0
 
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
@@ -144,6 +145,7 @@ class SchedulerMetricsCollector:
         self,
         labels: Dict[str, str],
         enable_lora: bool = False,
+        enable_hierarchical_cache: bool = False,
         server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
@@ -151,6 +153,7 @@ class SchedulerMetricsCollector:
 
         self.labels = labels
         self.enable_lora = enable_lora
+        self.enable_hierarchical_cache = enable_hierarchical_cache
         self.last_log_time = time.perf_counter()
 
         self.num_running_reqs = Gauge(
@@ -316,35 +319,35 @@ class SchedulerMetricsCollector:
             documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
-        self.kv_transfer_speed_gb_s = Gauge(
+        self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
-            documentation="The transfer speed of the KV cache in GB/s.",
+            documentation="Histogram of KV cache transfer speed in GB/s.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(0.1, 0.5, 1, 5, 10, 25, 50, 100, 200, 400),
         )
-        self.kv_transfer_latency_ms = Gauge(
+        self.kv_transfer_latency_ms = Histogram(
             name="sglang:kv_transfer_latency_ms",
-            documentation="The transfer latency of the KV cache in ms.",
+            documentation="Histogram of KV cache transfer latency in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
         )
-        self.kv_transfer_bootstrap_ms = Gauge(
+        self.kv_transfer_bootstrap_ms = Histogram(
             name="sglang:kv_transfer_bootstrap_ms",
-            documentation="The bootstrap time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer bootstrap time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
         )
-        self.kv_transfer_alloc_ms = Gauge(
+        self.kv_transfer_alloc_ms = Histogram(
             name="sglang:kv_transfer_alloc_ms",
-            documentation="The allocation waiting time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer allocation waiting time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
         )
-        self.kv_transfer_total_mb = Gauge(
+        self.kv_transfer_total_mb = Histogram(
             name="sglang:kv_transfer_total_mb",
-            documentation="The total number of tokens transferred in the KV cache.",
+            documentation="Histogram of KV cache transfer size in MB.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
         )
 
         # Utilization
@@ -599,6 +602,21 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        # HiCache host-tier metrics (only created when hierarchical cache is enabled)
+        if self.enable_hierarchical_cache:
+            self.hicache_host_used_tokens = Gauge(
+                name="sglang:hicache_host_used_tokens",
+                documentation="Number of tokens currently used in the host KV cache.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_total_tokens = Gauge(
+                name="sglang:hicache_host_total_tokens",
+                documentation="Total capacity of the host KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
         self.num_unique_running_routing_keys = Gauge(
             name="sglang:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
@@ -728,6 +746,24 @@ class SchedulerMetricsCollector:
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
+    def observe_kv_transfer_metrics(
+        self,
+        latency_ms: float,
+        total_mb: float,
+        speed_gb_s: float,
+    ) -> None:
+        self._log_histogram(self.kv_transfer_latency_ms, latency_ms)
+        self._log_histogram(self.kv_transfer_total_mb, total_mb)
+        self._log_histogram(self.kv_transfer_speed_gb_s, speed_gb_s)
+
+    def observe_kv_transfer_bootstrap(
+        self,
+        bootstrap_ms: float,
+        alloc_ms: float,
+    ) -> None:
+        self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
+        self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
@@ -859,12 +895,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
-        self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
-        self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
-        self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
-        self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
-        self._log_gauge(self.kv_transfer_total_mb, stats.kv_transfer_total_mb)
-
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
         self._log_gauge(self.num_paused_reqs, stats.num_paused_reqs)
@@ -893,6 +923,15 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
+
+        # HiCache host-tier metrics (only logged if hierarchical cache is enabled)
+        if self.enable_hierarchical_cache:
+            self._log_gauge(
+                self.hicache_host_used_tokens, stats.hicache_host_used_tokens
+            )
+            self._log_gauge(
+                self.hicache_host_total_tokens, stats.hicache_host_total_tokens
+            )
 
         self._log_gauge(
             self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys
