@@ -501,17 +501,13 @@ class Fp8LinearMethod(LinearMethodBase):
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
         qweight, weight_scale = mxfp8_group_quantize(weight)
-        # Keep parameter objects to preserve weight_loader attrs for hot reload.
-        layer.weight.data = qweight
-        layer.weight.requires_grad_(False)
+        # Keep parameter identities stable for CUDA graph reuse and hot reload.
+        copy_or_rebind_param(layer, "weight", qweight)
         if hasattr(layer, "weight_scale_inv") and layer.weight_scale_inv is not None:
-            layer.weight_scale_inv.data = weight_scale
-            layer.weight_scale_inv.requires_grad_(False)
+            copy_or_rebind_param(layer, "weight_scale_inv", weight_scale)
         else:
             # First-time online MXFP8 quantization (no serialized scales).
-            layer.register_parameter(
-                "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
-            )
+            copy_or_rebind_param(layer, "weight_scale_inv", weight_scale)
         layer.weight_scale_inv.format_ue8m0 = True
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None

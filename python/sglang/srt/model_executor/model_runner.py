@@ -1826,6 +1826,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.disable_flashinfer_autotune:
             return False
 
+        # Skip autotune for mxfp8 quantization on SM120, as mxfp8 linear layers
+        # use Triton kernels (not FlashInfer) and the dummy run causes OOM errors.
+        if self.server_args.quantization == "mxfp8":
+            return False
+
         backend_str = self.server_args.moe_runner_backend
 
         # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
