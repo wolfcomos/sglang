@@ -1498,17 +1498,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         if nvfp4_online_input_scale_enabled():
             input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
-            # Both alpha and input_scale_inv are scalar tensors (0-dim).
-            # Directly assign scalar values without expand_as() to avoid shape issues
-            # during CUDA graph capture with vmap.
-            alpha_value = (layer.gemm_weight_scale * input_scale).to(torch.float32)
-            if alpha_value.dim() > 0:
-                alpha_value = alpha_value.squeeze()
-            layer.alpha.copy_(alpha_value)
-            input_scale_inv_value = input_scale_inv.to(torch.float32)
-            if input_scale_inv_value.dim() > 0:
-                input_scale_inv_value = input_scale_inv_value.squeeze()
-            layer.input_scale_inv.copy_(input_scale_inv_value)
+            layer.alpha.copy_(
+                (layer.gemm_weight_scale * input_scale).expand_as(layer.alpha)
+            )
+            layer.input_scale_inv.copy_(
+                input_scale_inv.expand_as(layer.input_scale_inv)
+            )
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
