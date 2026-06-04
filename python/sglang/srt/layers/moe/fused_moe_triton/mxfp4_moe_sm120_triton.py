@@ -27,6 +27,125 @@ import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
+_MXFP4_BLOCK_SIZE = 32
+
+
+def _mxfp4_e8m0_scale_to_float32(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype == torch.float32:
+        return scale
+    if scale.dtype == torch.float8_e8m0fnu:
+        return scale.to(torch.float32)
+    return torch.exp2(scale.to(torch.float32) - 127.0)
+
+
+def _dequant_mxfp4_packed_torch(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize one MXFP4 weight matrix (DSv4 packed int8 + block scales)."""
+    from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+
+    packed_u8 = packed.contiguous().view(torch.uint8)
+    if scale.dtype == torch.uint8:
+        scale_u8 = scale.contiguous()
+    else:
+        scale_f32 = _mxfp4_e8m0_scale_to_float32(scale)
+        scale_u8 = (
+            torch.log2(scale_f32.clamp(min=1e-30)) + 127.0
+        ).round().clamp(0, 255).to(torch.uint8)
+    return MXFP4QuantizeUtil.dequantize(
+        packed_u8,
+        out_dtype,
+        scale_u8,
+        block_sizes=[_MXFP4_BLOCK_SIZE],
+    )
+
+
+def mxfp4_gemm_torch(
+    A: torch.Tensor,
+    B_packed: torch.Tensor,
+    B_scale: torch.Tensor,
+    K_full: int,
+) -> torch.Tensor:
+    """PyTorch reference: ``A @ dequant(B_packed, B_scale).T``."""
+    _ = K_full
+    B = _dequant_mxfp4_packed_torch(B_packed, B_scale, out_dtype=A.dtype)
+    return A @ B.T
+
+
+def mxfp4_moe_forward_torch(
+    hidden_states: torch.Tensor,
+    w13_packed: torch.Tensor,
+    w2_packed: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    inplace: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    clamp_limit: Optional[float] = None,
+) -> torch.Tensor:
+    """PyTorch reference for ``mxfp4_moe_forward_triton`` (not CUDA-graph safe)."""
+    import torch.nn.functional as F
+
+    _ = hidden_size, inplace
+    M, K = hidden_states.shape
+    topk = topk_ids.shape[1]
+    I = intermediate_size
+    E = w13_packed.shape[0]
+    num_slots = M * topk
+    dtype = hidden_states.dtype
+    device = hidden_states.device
+
+    w13_dq = torch.stack(
+        [
+            _dequant_mxfp4_packed_torch(w13_packed[e], w13_scale[e], out_dtype=dtype)
+            for e in range(E)
+        ],
+        dim=0,
+    )
+    w2_dq = torch.stack(
+        [
+            _dequant_mxfp4_packed_torch(w2_packed[e], w2_scale[e], out_dtype=dtype)
+            for e in range(E)
+        ],
+        dim=0,
+    )
+
+    flat_expert_ids_raw = topk_ids.reshape(-1).contiguous()
+    invalid_slot_mask = flat_expert_ids_raw < 0
+    expert_ids = flat_expert_ids_raw.clamp(min=0)
+    token_ids = (
+        torch.arange(M, device=device, dtype=torch.long)
+        .unsqueeze(1)
+        .expand(M, topk)
+        .reshape(-1)
+    )
+
+    h = hidden_states[token_ids]
+    w13 = w13_dq[expert_ids]
+    intermediate = torch.bmm(h.unsqueeze(1), w13.transpose(1, 2)).squeeze(1)
+    gate = intermediate[:, :I].float()
+    up = intermediate[:, I:].float()
+    if clamp_limit is not None and clamp_limit > 0:
+        gate = torch.clamp(gate, max=clamp_limit)
+        up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
+    activated = (F.silu(gate) * up).to(dtype)
+    w2 = w2_dq[expert_ids]
+    down = torch.bmm(activated.unsqueeze(1), w2.transpose(1, 2)).squeeze(1)
+
+    valid_mask = (~invalid_slot_mask).unsqueeze(1).to(dtype)
+    down = down * valid_mask
+    flat_weights = topk_weights.reshape(-1).unsqueeze(1).to(dtype)
+    output = (down * flat_weights).view(M, topk, K).sum(dim=1)
+    if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+        output = output * routed_scaling_factor
+    return output
+
 
 @triton.jit
 def _dequant_fp4_lut(nibble):
@@ -164,6 +283,48 @@ def _mxfp4_slot_gemv_kernel(
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_I": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_I": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_I": 256}, num_warps=4, num_stages=2),
+    ],
+    key=["I"],
+)
+@triton.jit
+def _silu_mul_clamp_inplace_kernel(
+    X_ptr,  # [num_slots, 2*I] bf16/fp16
+    I: tl.int32,
+    stride_xm: tl.int32,
+    clamp_limit: tl.float32,
+    USE_CLAMP: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    """In-place ``silu(gate) * up`` over ``X[:, :I]`` with optional clamp.
+
+    Input:
+      gate = X[:, :I], up = X[:, I:2I]
+    Output:
+      X[:, :I] = silu(gate) * up
+    """
+    slot_id = tl.program_id(0)
+    i_block = tl.program_id(1)
+
+    offs_i = i_block * BLOCK_I + tl.arange(0, BLOCK_I)
+    i_mask = offs_i < I
+    x_base = slot_id * stride_xm
+
+    gate = tl.load(X_ptr + x_base + offs_i, mask=i_mask, other=0.0).to(tl.float32)
+    up = tl.load(X_ptr + x_base + I + offs_i, mask=i_mask, other=0.0).to(tl.float32)
+
+    if USE_CLAMP:
+        gate = tl.minimum(gate, clamp_limit)
+        up = tl.maximum(tl.minimum(up, clamp_limit), -clamp_limit)
+
+    activated = gate * tl.sigmoid(gate) * up
+    tl.store(X_ptr + x_base + offs_i, activated, mask=i_mask)
+
+
 # ── Legacy per-expert GEMM kernel (kept for benchmarking) ──
 
 
@@ -288,10 +449,7 @@ def mxfp4_gemm_triton(
     N = B_packed.shape[0]
     K = K_full
 
-    if B_scale.dtype == torch.float8_e8m0fnu:
-        B_scale = B_scale.to(torch.float32)
-    elif B_scale.dtype != torch.float32:
-        B_scale = B_scale.float()
+    B_scale = _mxfp4_e8m0_scale_to_float32(B_scale)
 
     C = torch.empty(M, N, dtype=torch.bfloat16, device=A.device)
     A = A.contiguous()
@@ -344,8 +502,6 @@ def mxfp4_moe_forward_triton(
     Each (token, expert) slot is processed independently with a fixed grid,
     eliminating .unique()/.item()/.nonzero() that break CUDA graph capture.
     """
-    import torch.nn.functional as F
-
     M, K = hidden_states.shape
     topk = topk_ids.shape[1]
     I = intermediate_size
@@ -369,11 +525,8 @@ def mxfp4_moe_forward_triton(
         .contiguous()
     )  # [M*topk]
 
-    # ── Ensure scales are float32 ──
-    if w13_scale.dtype != torch.float32:
-        w13_scale = w13_scale.to(torch.float32)
-    if w2_scale.dtype != torch.float32:
-        w2_scale = w2_scale.to(torch.float32)
+    w13_scale = _mxfp4_e8m0_scale_to_float32(w13_scale)
+    w2_scale = _mxfp4_e8m0_scale_to_float32(w2_scale)
 
     # ── GEMM1: gate_up projection ──
     # hidden_states[token] @ w13[expert].T → [num_slots, 2*I]
@@ -401,13 +554,18 @@ def mxfp4_moe_forward_triton(
         intermediate.stride(0),
     )
 
-    # ── SiLU activation (graph-safe vectorized ops) ──
-    gate = intermediate[:, :I].float()
-    up = intermediate[:, I:].float()
-    if clamp_limit is not None and clamp_limit > 0:
-        gate = torch.clamp(gate, max=clamp_limit)
-        up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
-    activated = (F.silu(gate) * up).to(dtype)
+    # ── SiLU activation fused in Triton, written in-place to intermediate[:, :I] ──
+    use_clamp = clamp_limit is not None and clamp_limit > 0
+    clamp_value = float(clamp_limit) if use_clamp else 0.0
+    grid_act = lambda meta: (num_slots, triton.cdiv(I, meta["BLOCK_I"]))
+    _silu_mul_clamp_inplace_kernel[grid_act](
+        intermediate,
+        I,
+        intermediate.stride(0),
+        clamp_value,
+        USE_CLAMP=use_clamp,
+    )
+    activated = intermediate[:, :I]
 
     # ── GEMM2: down projection ──
     # activated[slot] @ w2[expert].T → [num_slots, K]
